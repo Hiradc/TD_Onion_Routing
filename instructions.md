@@ -23,7 +23,7 @@ This basic express server should, as for nodes, have a `/status/` HTTP GET route
 
 The registry's goal is to keep track of all nodes in the network.
 
-In the same way as for nodes and users, the registry is a basic express server. It listens to requests on a specific port. It is defined by the `REGISTRY_PORT` variable (in [./src/config.ts](./src/config.ts)).
+In the same way as for nodes and users, the registry is a basic express server. It listens to requests on a specific port. It is defined by the `BASE_ONION_ROUTER_PORT` variable (in [./src/config.ts](./src/config.ts)).
 
 This basic express server should, as for nodes, have a `/status/` HTTP GET route which simply responds with the string `live` when called.
 

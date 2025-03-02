@@ -1,79 +1,133 @@
 import bodyParser from "body-parser";
 import express from "express";
-import { BASE_ONION_ROUTER_PORT,REGISTRY_PORT } from "../config";
-import axios from "axios";
-import {exportPrvKey, exportPubKey, generateRsaKeyPair, importSymKey, rsaDecrypt, symDecrypt} from "../crypto";
+import { BASE_ONION_ROUTER_PORT, REGISTRY_PORT } from "../config";
+import { generateRsaKeyPair, exportPubKey, exportPrvKey, rsaDecrypt, symDecrypt } from "../crypto";
+import { webcrypto } from "crypto";
 
+declare global {
+  var nodeKeys: Record<number, { publicKey: webcrypto.CryptoKey; privateKey: webcrypto.CryptoKey }>;
+  var nodeStates: Record<number, { 
+    lastReceivedEncryptedMessage: string | null;
+    lastReceivedDecryptedMessage: string | null;
+    lastMessageDestination: number | null;
+  }>;
+}
 
 export async function simpleOnionRouter(nodeId: number) {
   const onionRouter = express();
   onionRouter.use(express.json());
   onionRouter.use(bodyParser.json());
-  let lastReceivedEncryptedMessage : any = null;
-  let lastReceivedDecryptedMessage : any = null;
-  let lastMessageDestination : any = null;
-  const port = BASE_ONION_ROUTER_PORT + nodeId;
 
-  const { publicKey, privateKey } = await generateRsaKeyPair();
-  const pubKey = await exportPubKey(publicKey);
-  const prvKey = await exportPrvKey(privateKey);
+  // global storage of the keys
+  if (!globalThis.nodeKeys) {
+    globalThis.nodeKeys = {};
+  }
 
+  // check if key already exist
+  if (!globalThis.nodeKeys[nodeId]) {
+    globalThis.nodeKeys[nodeId] = await generateRsaKeyPair();
+  }
 
-  //register the onion router
-  axios.post("http://localhost:" + REGISTRY_PORT + "/registerNode", {
-    nodeId: nodeId,
-    publicKey: pubKey,
-    privateKey: prvKey,
-  });
+  if (!globalThis.nodeStates) {
+    globalThis.nodeStates = {};
+  }
+  if (!globalThis.nodeStates[nodeId]) {
+    globalThis.nodeStates[nodeId] = {
+      lastReceivedEncryptedMessage: null,
+      lastReceivedDecryptedMessage: null,
+      lastMessageDestination: null
+    };
+  }
 
-  onionRouter.get("/getPrivateKey", async (req, res) => {
-    res.json({ result: prvKey });
-  });
+  const { publicKey, privateKey } = globalThis.nodeKeys[nodeId];
+  const publicKeyBase64 = await exportPubKey(publicKey);
+  const privateKeyBase64 = await exportPrvKey(privateKey);
 
+  const registerNode = async () => {
+    try {
+        const response = await fetch(`http://localhost:${REGISTRY_PORT}/registerNode`, {
+            method: "POST",
+            headers: {
+                "Content-Type": "application/json",
+            },
+            body: JSON.stringify({
+                nodeId,
+                pubKey: publicKeyBase64,
+            }),
+        });
 
+        if (!response.ok) {
+            throw new Error(`HTTP error: ${response.status}`);
+        }
 
-
+        const data = await response.json();
+        console.log("Server response:", data);
+    } catch (error) {
+        console.error("Error during the register:", error);
+    }
+  };
+  registerNode();
 
   onionRouter.get("/status", (req, res) => {
     res.send("live");
   });
 
   onionRouter.get("/getLastReceivedEncryptedMessage", (req, res) => {
-    res.json({ result: lastReceivedEncryptedMessage });
+    res.json({ result: globalThis.nodeStates[nodeId].lastReceivedEncryptedMessage });
   });
 
   onionRouter.get("/getLastReceivedDecryptedMessage", (req, res) => {
-    res.json({ result: lastReceivedDecryptedMessage });
+    res.json({ result: globalThis.nodeStates[nodeId].lastReceivedDecryptedMessage });
   });
 
   onionRouter.get("/getLastMessageDestination", (req, res) => {
-    res.json({ result: lastMessageDestination });
+    res.json({ result: globalThis.nodeStates[nodeId].lastMessageDestination });
+  });
+
+  onionRouter.get("/getPrivateKey", (req, res) => {
+    res.json({ result: privateKeyBase64 });
   });
 
   onionRouter.post("/message", async (req, res) => {
-    const { message } = req.body;
+    try {
+      const { message }: { message: string } = req.body;
+      if(!message){
+        res.status(400).json({error: "Missing message"});
+        return ;
+      }
+      const encryptedSymKey = message.slice(0, 344);
+      const restOfMessage = message.slice(344);
+      const symKey = await rsaDecrypt(encryptedSymKey, privateKey);
 
-    // Split the message into encrypted symmetric key and encrypted message
-    const [encryptedSymKey, encryptedMessage] = message.split(".");
-    console.log(encryptedSymKey);
+      const decryptedMessage = await symDecrypt(symKey, restOfMessage);
+      const nextDestination = parseInt(decryptedMessage.slice(0, 10), 10);
+      const nextMessage = decryptedMessage.slice(10);
+      console.log(`message: ${message}`)
+      console.log(`nextDestination: ${nextDestination}`)
+      console.log(`nextMessage: ${nextMessage}`)
 
-    // Decrypt the symmetric key with the private RSA key
-    const symKeyString = await rsaDecrypt(encryptedSymKey, privateKey);
-    console.log(symKeyString);
-    /*
-    // Import the symmetric key
-    const symKey = await importSymKey(symKeyString);
+      globalThis.nodeStates[nodeId].lastReceivedEncryptedMessage = message;
+      globalThis.nodeStates[nodeId].lastReceivedDecryptedMessage = nextMessage;
+      globalThis.nodeStates[nodeId].lastMessageDestination = nextDestination;
 
-    // Decrypt the message with the symmetric key
-    const decryptedMessage = await symDecrypt(symKey, encryptedMessage);
+      const nextUrl = `http://localhost:${nextDestination}/message`;
 
-    // Log the decrypted message
-    console.log(decryptedMessage);
-    */
-    // Send response
-    res.status(200).json({ message: "Message received successfully" });
+      const response = await fetch(nextUrl, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ message: nextMessage }),
+      });
+
+      if (!response.ok) {
+        throw new Error(`HTTP error: ${response.status}`);
+      }
+      res.json({ status: "Message decrypt successfully" });
+
+    } catch (error) {
+      console.error("Error while decrypting the message:", error);
+      res.status(500).json({ error: "Internal error while sending the message" });
+    }
   });
-
 
   const server = onionRouter.listen(BASE_ONION_ROUTER_PORT + nodeId, () => {
     console.log(
